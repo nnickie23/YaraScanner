@@ -8,14 +8,82 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#include "cJSON.h"
-#include "yara.h"
+#include "lib/cJSON.h"
+#include "lib/yara.h"
 
+/* Declarations: */
+
+char *dir_path = NULL;
+char *rule_filename = NULL;
+char *output_filename = NULL;
+FILE *output_file = NULL; 
+FILE *rule_file = NULL;
+YR_RULES *rules = NULL;
 cJSON *RESULT = NULL;
+
+void destroy_yara_rules(YR_RULES* rules);
+void destroy(void);
+void make_error(const char* msg);
+char *get_file_name(char *path);
+cJSON *json_create_object(char *file);
+int yr_callback(YR_SCAN_CONTEXT* context, int message, void* message_data, void* user_data);
+int is_php(char *file_name);
+int is_regular_file(const char *path);
+int is_directory(const char *path);
+int parse(char *dirpath);
+void yr_compiler_callback(int error_level, const char* file_name, int line_number, const YR_RULE* rule,
+                          const char* message, void* user_data);
+YR_RULES *get_yara_rules(FILE *rule_file, const char *rule_filename);
+FILE *get_file(const char *filename, char *mode);
+char *get_full_path(const char *file_name);
+void init(int argc, char **argv);
+
+/* Implementations: */
+
+void destroy_yara_rules(YR_RULES* rules)
+{
+    if (yr_rules_destroy(rules) != ERROR_SUCCESS)
+    {
+        make_error("Failed to destroy rules");
+    }
+    if (yr_finalize() != ERROR_SUCCESS)
+    {
+        make_error("Failed to finalize Yara");
+    }
+}
+
+void destroy(void)
+{
+    if (rules != NULL)
+    {
+        destroy_yara_rules(rules);
+    }
+    if (rule_file != NULL)
+    {
+        fclose(rule_file);
+    }
+    if (output_file != NULL)
+    {
+        fclose(output_file);
+    }
+    if (dir_path != NULL)
+    {
+        free(dir_path);
+    }
+    if (rule_filename != NULL)
+    {
+        free(rule_filename);
+    }
+    if (RESULT != NULL)
+    {
+        cJSON_Delete(RESULT);
+    }
+}
 
 void make_error(const char* msg)
 {
     fprintf(stderr, "Error: %s\n", msg);
+    destroy();
     exit(1);
 }
 
@@ -25,7 +93,7 @@ char *get_file_name(char *path)
     ret = basename(path);
     if (ret == NULL)
     {
-        make_error("Failed to get file name.\n");
+        make_error("Failed to get file name");
     }
     return (ret);
 }
@@ -45,39 +113,39 @@ cJSON *json_create_object(char *file)
 
     if (stat(file, &st) != 0)
     {
-        snprintf(buf, sizeof(buf), "%s.", strerror(errno));
+        snprintf(buf, sizeof(buf), "stat(pathname = %s, st) failed: %s", file, strerror(errno));
         make_error(buf);
     }
 
     ret = cJSON_CreateObject();
     if (ret == NULL)
     {
-        make_error("Failed to create json object.\n");
+        make_error("Failed to create json object");
     }
 
     name = cJSON_CreateString(get_file_name(file));
     if (name == NULL)
     {
-        make_error("Failed to create json string.\n");
+        make_error("Failed to create json string");
     }
 
     size = cJSON_CreateNumber(st.st_size);
     if (size == NULL)
     {
-        make_error("Failed to create json number.\n");
+        make_error("Failed to create json number");
     }
 
     path = cJSON_CreateString(file);
     if (path == NULL)
     {
-        make_error("Failed to create json string.\n");
+        make_error("Failed to create json string");
     }
 
     strftime(time, 50, "%Y-%m-%d %H:%M:%S", localtime(&st.st_mtime));
     date_of_last_modification = cJSON_CreateString(time);
     if (date_of_last_modification == NULL)
     {
-        make_error("Failed to create json string.\n");
+        make_error("Failed to create json string");
     }
 
     permissions[0] = (S_ISDIR(st.st_mode)) ? 'd' : '-';
@@ -95,7 +163,7 @@ cJSON *json_create_object(char *file)
     access_permissions = cJSON_CreateString(permissions);
     if (access_permissions == NULL)
     {
-        make_error("Failed to create json string.\n");
+        make_error("Failed to create json string");
     }
 
     cJSON_AddItemToObject(ret, "name", name);
@@ -142,10 +210,14 @@ int is_php(char *file_name)
     int len;
     
     len = strlen(file_name);
-    if(len > 3 && strcmp(&file_name[len - 4], ".php") == 0)
+    if (len > 3 && strcmp(&file_name[len - 4], ".php") == 0)
+    {
         return (1);
+    }
     else
+    {
         return (0);
+    }
 }
 
 int is_regular_file(const char *path)
@@ -155,7 +227,7 @@ int is_regular_file(const char *path)
 
     if (stat(path, &st) != 0)
     {
-        snprintf(buf, sizeof(buf), "%s.", strerror(errno));
+        snprintf(buf, sizeof(buf), "stat(pathname = %s, st) failed: %s", path, strerror(errno));
         make_error(buf);
     }
     return S_ISREG(st.st_mode);
@@ -168,47 +240,26 @@ int is_directory(const char *path)
 
     if (stat(path, &st) != 0)
     {
-        snprintf(buf, sizeof(buf), "%s.", strerror(errno));
+        snprintf(buf, sizeof(buf),  "stat(pathname = %s, st) failed: %s", path, strerror(errno));
         make_error(buf);
     }
     return S_ISDIR(st.st_mode);
 }
 
-void yr_compiler_callback(int error_level, const char* file_name, int line_number, const YR_RULE* rule,
-const char* message, void* user_data)
-{
-    char buf[PATH_MAX + 1];
-    if (error_level == YARA_ERROR_LEVEL_ERROR)
-    {
-        snprintf(buf, sizeof(buf), "Error at line %d, in file \"%s\".\nMessage: \"%s\".", line_number, file_name, message);
-        make_error(buf);
-    }
-    else if (error_level == YARA_ERROR_LEVEL_WARNING)
-    {
-        snprintf(buf, sizeof(buf), "Warning at line %d, in file \"%s\".\nMessage: \"%s\".", line_number, file_name, message);
-        make_error(buf);
-    }
-}
-
-void close_file(FILE* file)
-{
-    fclose(file);
-}
-
-int parse_files(char *dirpath,  YR_RULES *rules)
+int parse(char *dirpath)
 {
     DIR *dir = NULL;
     struct dirent *dirent = NULL;
     char path[PATH_MAX + 1];
     char buf[PATH_MAX + 1];
 
-    if((dir = opendir(dirpath)) == NULL)
+    if ((dir = opendir(dirpath)) == NULL)
     {
-        snprintf(buf, sizeof(buf), "Failed to open directory \"%s\".", dirpath);
+        snprintf(buf, sizeof(buf), "Failed to open directory \"%s\"", dirpath);
         make_error(buf);
     }
 
-    while((dirent = readdir(dir)) != NULL)
+    while ((dirent = readdir(dir)) != NULL)
     {
         if (strcmp(dirent->d_name, ".") != 0 && strcmp(dirent->d_name, "..") != 0)
         {
@@ -220,28 +271,31 @@ int parse_files(char *dirpath,  YR_RULES *rules)
             {
                 if (yr_rules_scan_file(rules, path, 0, &yr_callback, (void*) path, 0) != ERROR_SUCCESS)
                 {
-                    make_error("Failed to scan file.\n");
+                    make_error("Failed to scan file");
                 }
             }
-
             else if (is_directory(path))
             {
-                parse_files(path, rules);
+                parse(path);
             }
         }
     }
     closedir(dir);
 }
 
-void destroy_yara_rules(YR_RULES* rules)
+void yr_compiler_callback(int error_level, const char* file_name, int line_number, const YR_RULE* rule,
+                          const char* message, void* user_data)
 {
-    if (yr_rules_destroy(rules) != ERROR_SUCCESS)
+    char buf[PATH_MAX + 1];
+    if (error_level == YARA_ERROR_LEVEL_ERROR)
     {
-        make_error("Failed to destroy rules.");
+        snprintf(buf, sizeof(buf), "Error at line %d, in file \"%s\";\nMessage: \"%s\"", line_number, file_name, message);
+        make_error(buf);
     }
-    if (yr_finalize() != ERROR_SUCCESS)
+    else if (error_level == YARA_ERROR_LEVEL_WARNING)
     {
-        make_error("Failed to finalize Yara.");
+        snprintf(buf, sizeof(buf), "Warning at line %d, in file \"%s\";\nMessage: \"%s\"", line_number, file_name, message);
+        make_error(buf);
     }
 }
 
@@ -252,7 +306,7 @@ YR_RULES *get_yara_rules(FILE *rule_file, const char *rule_filename)
 
     if (yr_initialize() != ERROR_SUCCESS)
     {
-        make_error("Failed to initialize Yara.");
+        make_error("Failed to initialize Yara");
     }
 
     yr_compiler_create(&(compiler));
@@ -265,51 +319,32 @@ YR_RULES *get_yara_rules(FILE *rule_file, const char *rule_filename)
 
     if ((yr_compiler_get_rules(compiler, &(ret))) == ERROR_INSUFFICIENT_MEMORY)
     {
-        make_error("Insufficient memory to complete the operation.");
+        make_error("Insufficient memory to complete the operation");
     }
 
     return (ret);
 
 }
 
-FILE* get_output_file(const char *output_filename)
+FILE *get_file(const char *filename, char *mode)
 {
     FILE *ret = NULL;
     char buf[PATH_MAX + 1];
-    if (output_filename != NULL)
+    ret = fopen(filename, mode);
+    
+    if (ret == NULL)
     {
-        ret = fopen(output_filename, "r");
-        if (ret != NULL)
+        if (mode == "r")
         {
-            snprintf(buf, sizeof(buf), "\"%s\" already exists.", output_filename);
-            make_error(buf);
+            make_error("Failed to open yara rule file");
         }
         else
         {
-            ret = fopen(output_filename, "w");
-            if (ret == NULL)
-            {
-                snprintf(buf, sizeof(buf), "cannot create output file \"%s\".\n", output_filename);
-                make_error(buf);
-            }
+            snprintf(buf, sizeof(buf), "Cannot create output file \"%s\"", filename);
+            make_error(buf);
         }
     }
-    else
-    {
-        ret = stdout;
-    }
     return (ret);
-}
-
-FILE *get_rule_file(const char *rule_filename)
-{
-    FILE *ret = NULL;
-    ret = fopen(rule_filename, "r");
-    if (ret == NULL)
-    {
-        make_error("failed to open yara rule file.");
-    }
-    return(ret);
 }
 
 char *get_full_path(const char *file_name)
@@ -321,67 +356,44 @@ char *get_full_path(const char *file_name)
     ptr = realpath(file_name, ret);
     if (ptr == NULL)
     {
-        snprintf(buf, sizeof(buf), "%s",  strerror(errno));
+        snprintf(buf, sizeof(buf), "%s: \"%s\"",  strerror(errno), file_name);
         make_error(buf);
     }
 
     return (strdup(ret));
 }
 
-void json_destroy_result(void)
+void init(int argc, char **argv)
 {
-    cJSON_Delete(RESULT);
-}
-
-void json_initialize_result(void)
-{
+    if (argc < 3)
+    {
+        make_error("Not enough input arguments");
+    }
+    dir_path = get_full_path(argv[1]); //dirpath is an absolute path
+    rule_filename = get_full_path(argv[2]);
+    if (argc == 4)
+    {
+        output_filename = argv[3];
+        output_file = get_file(output_filename, "w");
+    }
+    else if (argc == 3)
+    {
+        output_file = stdout;
+    }
+    rule_file = get_file(rule_filename, "r");
+    rules = get_yara_rules(rule_file, rule_filename);
     RESULT = cJSON_CreateArray();
     if (RESULT == NULL)
     {
-        make_error("failed to create a JSON array.");
+        make_error("Failed to create a JSON array");
     }
 }
 
 int main(int argc, char *argv[])
 {
-    char *dir_path = NULL;
-    char *rule_filename = NULL;
-    char *output_filename = NULL;
-    FILE *output_file = NULL; 
-    FILE *rule_file = NULL;
-    YR_RULES *rules = NULL;
-
-    if (argc < 3)
-    {
-        make_error("not enough input arguments.");
-    }
-
-    json_initialize_result(); //create json array called RESULT.
-
-    dir_path = get_full_path(argv[1]); //dirpath is an absolute path
-    rule_filename = get_full_path(argv[2]);
-
-    if (argc == 4)
-        output_filename = argv[3];
-
-    rule_file = get_rule_file(rule_filename);
-    output_file = get_output_file(output_filename);
-  
-    rules = get_yara_rules(rule_file, rule_filename);
-
-    parse_files(dir_path, rules);
-
+    init(argc, argv);
+    parse(dir_path);
     fprintf(output_file, "%s", cJSON_Print(RESULT));
-
-    destroy_yara_rules(rules);
-
-    close_file(rule_file);
-    close_file(output_file);
-
-    free(dir_path);
-    free(rule_filename);
-
-    json_destroy_result();
-
+    destroy();
     return (0);
 }
