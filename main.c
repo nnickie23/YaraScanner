@@ -2,10 +2,12 @@
 #include <errno.h>
 #include <libgen.h>
 #include <linux/limits.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
 
 #include "lib/cJSON.h"
@@ -103,13 +105,20 @@ cJSON *json_create_object(char *file)
     cJSON *ret = NULL;
     cJSON *name = NULL;
     cJSON *size = NULL;
+    cJSON *dev_ID = NULL;
+    cJSON *maj = NULL;
+    cJSON *min = NULL;
+    cJSON *inode = NULL;
+    cJSON *h_links = NULL;
     cJSON *path = NULL;
     cJSON *date_of_last_modification = NULL;
     cJSON *access_permissions = NULL;
+
     struct stat st;
     char time[50];
     char permissions[11];
     char buf[PATH_MAX + 1];
+    char inode_str[PATH_MAX];
 
     if (stat(file, &st) != 0)
     {
@@ -134,6 +143,37 @@ cJSON *json_create_object(char *file)
     {
         make_error("Failed to create json number");
     }
+
+    dev_ID = cJSON_CreateArray();
+    if (dev_ID == NULL)
+    {
+        make_error("Failed to create json array");
+    }
+    maj = cJSON_CreateNumber(major(st.st_dev));
+    if (maj == NULL)
+    {
+        make_error("Failed to create json number");
+    }
+    min = cJSON_CreateNumber(minor(st.st_dev));
+    if (min == NULL)
+    {
+        make_error("Failed to create json number");
+    }
+    cJSON_AddItemToArray(dev_ID, maj);
+    cJSON_AddItemToArray(dev_ID, min);
+
+    snprintf(inode_str, sizeof(inode_str), "%ju", (uintmax_t)st.st_ino);
+    inode = cJSON_CreateString(inode_str);
+    if (inode == NULL)
+    {
+        make_error("Failed to create json string");
+    }
+
+    h_links = cJSON_CreateNumber((unsigned int) st.st_nlink);
+    if (h_links == NULL)
+    {
+        make_error("Failed to create json number");
+    }    
 
     path = cJSON_CreateString(file);
     if (path == NULL)
@@ -168,6 +208,9 @@ cJSON *json_create_object(char *file)
 
     cJSON_AddItemToObject(ret, "name", name);
     cJSON_AddItemToObject(ret, "size", size);
+    cJSON_AddItemToObject(ret, "ID of device containing file", dev_ID);
+    cJSON_AddItemToObject(ret, "inode", inode);
+    cJSON_AddItemToObject(ret, "hard links", h_links);
     cJSON_AddItemToObject(ret, "path", path);
     cJSON_AddItemToObject(ret, "date of last modification", date_of_last_modification);
     cJSON_AddItemToObject(ret, "access permissions", access_permissions);
